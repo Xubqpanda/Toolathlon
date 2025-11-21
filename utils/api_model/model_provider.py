@@ -26,6 +26,7 @@ from openai._utils import PropertyInfo
 
 class ResponseOutputReasoningContent(BaseModel):
     reasoning_content: str
+    pure_thinking_str: str
     """The reasoning content from the model."""
     type: Literal["reasoning_content"] = "reasoning_content"
 
@@ -61,8 +62,18 @@ class ConverterWithExplicitReasoningContent(Converter):
         if hasattr(message, "reasoning_content") or hasattr(message, "reasoning_details"):
             # we assert they do not exist at the same time
             assert not (hasattr(message, "reasoning_content") and hasattr(message, "reasoning_details")), "WE DO NOT SUPPORT BOTH reasoning_content AND reasoning_details AT THE SAME TIME"
-            reasoning_content = message.reasoning_content if hasattr(message, "reasoning_content") else message.reasoning_details
-            message_item.content.append(ResponseOutputReasoningContent(reasoning_content=reasoning_content, type="reasoning_content"))
+            if hasattr(message, "reasoning_content"):
+                reasoning_content = json.dumps(message.reasoning_content)
+                pure_thinking_str = reasoning_content
+            else:
+                reasoning_content = json.dumps(message.reasoning_details)
+                pure_thinking_str = None
+                assert isinstance(message.reasoning_details, list), "REASONING_DETAILS SHOULD BE A LIST IN OUR DESIGN"
+                for detail in message.reasoning_details:
+                    if detail.get('type') == 'reasoning.text':
+                        pure_thinking_str = detail.get('text')
+                        break
+            message_item.content.append(ResponseOutputReasoningContent(reasoning_content=reasoning_content, pure_thinking_str=pure_thinking_str, type="reasoning_content"))
 
         if message.audio:
             raise AgentsException("Audio is not currently supported")
@@ -211,9 +222,9 @@ class ConverterWithExplicitReasoningContent(Converter):
                             f"Only audio IDs are supported for chat completions, but got: {c}"
                         )
                     elif c["type"] == "reasoning_content":
-                        new_asst["reasoning_content"] = c["reasoning_content"]
+                        new_asst["reasoning_content"] = json.loads(c["reasoning_content"]) # the reasoning_content is always a json string
                         # we also fill back the reasoning_details to the message
-                        new_asst["reasoning_details"] = c["reasoning_content"]
+                        new_asst["reasoning_details"] = json.loads(c["reasoning_content"])
                     else:
                         raise UserError(f"Unknown content type in ExtendedResponseOutputMessage: {c}")
 
@@ -569,13 +580,13 @@ class OpenAIChatCompletionsModelWithRetry(OpenAIChatCompletionsModel):
                 if self.debug:
                     for item in output_items:
                         if isinstance(item, ExtendedResponseOutputMessage):
-                            reasoning_content = None
+                            pure_thinking_str = None
                             for content in item.content:
                                 if isinstance(content, ResponseOutputReasoningContent):
-                                    reasoning_content = content.reasoning_content
+                                    pure_thinking_str = content.pure_thinking_str
                                     break
-                            if reasoning_content:
-                                print("\033[90mTHINKING: ", reasoning_content, "\033[0m")
+                            if pure_thinking_str:
+                                print("\033[90mTHINKING: ", pure_thinking_str.strip(), "\033[0m")
                             # find text content in the output items
                             text_content = None
                             for content in item.content:
