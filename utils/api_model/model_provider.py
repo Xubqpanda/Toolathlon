@@ -57,8 +57,12 @@ class ConverterWithExplicitReasoningContent(Converter):
             message_item.content.append(
                 ResponseOutputRefusal(refusal=message.refusal, type="refusal")
             )
-        if hasattr(message, "reasoning_content"):
-            message_item.content.append(ResponseOutputReasoningContent(reasoning_content=message.reasoning_content, type="reasoning_content"))
+        
+        if hasattr(message, "reasoning_content") or hasattr(message, "reasoning_details"):
+            # we assert they do not exist at the same time
+            assert not (hasattr(message, "reasoning_content") and hasattr(message, "reasoning_details")), "WE DO NOT SUPPORT BOTH reasoning_content AND reasoning_details AT THE SAME TIME"
+            reasoning_content = message.reasoning_content if hasattr(message, "reasoning_content") else message.reasoning_details
+            message_item.content.append(ResponseOutputReasoningContent(reasoning_content=reasoning_content, type="reasoning_content"))
 
         if message.audio:
             raise AgentsException("Audio is not currently supported")
@@ -208,6 +212,8 @@ class ConverterWithExplicitReasoningContent(Converter):
                         )
                     elif c["type"] == "reasoning_content":
                         new_asst["reasoning_content"] = c["reasoning_content"]
+                        # we also fill back the reasoning_details to the message
+                        new_asst["reasoning_details"] = c["reasoning_content"]
                     else:
                         raise UserError(f"Unknown content type in ExtendedResponseOutputMessage: {c}")
 
