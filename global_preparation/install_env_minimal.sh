@@ -32,6 +32,16 @@ if [ -s "$NVM_DIR/nvm.sh" ]; then
     nvm use 22.16.0 2>/dev/null || true
 fi
 
+# check current shell
+if [ -n "$ZSH_VERSION" ]; then
+    RC_FILE="$HOME/.zshrc"
+elif [ -n "$BASH_VERSION" ]; then
+    RC_FILE="$HOME/.bashrc"
+else
+    RC_FILE="$HOME/.profile"
+fi
+echo "Using RC file: $RC_FILE"
+
 NEED_INSTALL=false
 
 # Check if Node.js and npm are installed
@@ -71,7 +81,7 @@ if [ "$NEED_INSTALL" = true ]; then
         [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
 
         # Also add to current session
-        source ~/.bashrc 2>/dev/null || true
+        source $RC_FILE 2>/dev/null || true
     else
         # Load NVM if already installed
         export NVM_DIR="$HOME/.nvm"
