@@ -620,14 +620,18 @@ class ContextManagedRunner(Runner):
                 raw_content = current_record.get("raw_content", {})
                 role = "unknown"
                 content = ""
-                
+                pure_thinking_str = None
+
                 if isinstance(raw_content, dict):
                     role = raw_content.get("role", "unknown")
-                    # Extract text content
+                    # Extract text content and reasoning content
                     content_parts = []
                     for content_item in raw_content.get("content", []):
-                        if isinstance(content_item, dict) and content_item.get("type") == "output_text":
-                            content_parts.append(content_item.get("text", ""))
+                        if isinstance(content_item, dict):
+                            if content_item.get("type") == "output_text":
+                                content_parts.append(content_item.get("text", ""))
+                            elif content_item.get("type") == "reasoning_content":
+                                pure_thinking_str = content_item.get("pure_thinking_str")
                     content = " ".join(content_parts)
                 
                 if role == "system" and "Context Management" in content:
@@ -638,10 +642,13 @@ class ContextManagedRunner(Runner):
                 # Check if this is the last message (no following tool call)
                 if item_index == len(records) - 1:
                     # Last message, final assistant reply
-                    formatted_messages.append({
+                    message = {
                         "role": role,
                         "content": content
-                    })
+                    }
+                    if pure_thinking_str:
+                        message["thinking"] = pure_thinking_str
+                    formatted_messages.append(message)
                     item_index += 1
                 else:
                     # Not last; check if tools follow
@@ -665,18 +672,24 @@ class ContextManagedRunner(Runner):
                     
                     if tool_calls:
                         # Assistant message with tool calls
-                        formatted_messages.append({
+                        message = {
                             "role": role,
                             "content": content,
                             "tool_calls": tool_calls
-                        })
+                        }
+                        if pure_thinking_str:
+                            message["thinking"] = pure_thinking_str
+                        formatted_messages.append(message)
                         item_index = next_index
                     else:
                         # No tool call
-                        formatted_messages.append({
+                        message = {
                             "role": role,
                             "content": content
-                        })
+                        }
+                        if pure_thinking_str:
+                            message["thinking"] = pure_thinking_str
+                        formatted_messages.append(message)
                         item_index += 1
                         
             elif current_record.get("item_type") == "tool_call_item":
