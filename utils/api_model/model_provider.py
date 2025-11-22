@@ -25,8 +25,8 @@ from openai._utils import PropertyInfo
 
 
 class ResponseOutputReasoningContent(BaseModel):
-    reasoning_content: str
-    pure_thinking_str: str
+    reasoning_content: str | None
+    pure_thinking_str: str | None
     """The reasoning content from the model."""
     type: Literal["reasoning_content"] = "reasoning_content"
 
