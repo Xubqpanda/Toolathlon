@@ -83,11 +83,12 @@ class ConverterWithExplicitReasoningContent(Converter):
 
         if message.tool_calls:
             for tool_call in message.tool_calls:
+                arguments = tool_call.function.arguments if tool_call.function.arguments else "{}"
                 items.append(
                     ResponseFunctionToolCall(
                         id=FAKE_RESPONSES_ID,
                         call_id=tool_call.id,
-                        arguments=tool_call.function.arguments,
+                        arguments=arguments,
                         name=tool_call.function.name,
                         type="function_call",
                     )
@@ -939,6 +940,13 @@ API_MAPPINGS = {
                    "anthropic": "claude-sonnet-4-5-20250929",
                    "openrouter": "anthropic/claude-sonnet-4.5"},
         price=[0.003, 0.015],
+        concurrency=32,
+        context_window=1000000,
+        openrouter_config={"provider": {"only": ["anthropic"]}}
+    ),
+    'claude-4.5-opus': Dict(
+        api_model={"openrouter": "anthropic/claude-opus-4.5"},
+        price=[0.005, 0.025],
         concurrency=32,
         context_window=1000000,
         openrouter_config={"provider": {"only": ["anthropic"]}}
