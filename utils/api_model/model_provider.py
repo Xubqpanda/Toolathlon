@@ -944,6 +944,13 @@ API_MAPPINGS = {
         context_window=1000000,
         openrouter_config={"provider": {"only": ["anthropic"]}}
     ),
+    'claude-4.5-opus': Dict(
+        api_model={"openrouter": "anthropic/claude-opus-4.5"},
+        price=[0.005, 0.025],
+        concurrency=32,
+        context_window=1000000,
+        openrouter_config={"provider": {"only": ["anthropic"]}}
+    ),
     'claude-4.5-haiku-1001': Dict(
         api_model={"anthropic": "claude-haiku-4-5-20251001",
                    "openrouter": "anthropic/claude-haiku-4.5"},

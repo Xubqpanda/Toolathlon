@@ -48,6 +48,9 @@ for attempt in {2..3}; do
         
         echo "Running $MODEL_SHORT_NAME with $PROVIDER, attempt $attempt ......"
 
+        # replace "/" with "_" in MODEL_SHORT_NAME
+        STORED_MODEL_SHORT_NAME=$(echo "$MODEL_SHORT_NAME" | sed 's|/|_|g')
+
         bash global_preparation/deploy_containers.sh $poste_configure_dovecot
         bash scripts/run_parallel.sh "$MODEL_SHORT_NAME" "$DUMP_PATH/${STORED_MODEL_SHORT_NAME}_${attempt}" "$PROVIDER" "$WROKERS" "$TASK_IMAGE"
     done
