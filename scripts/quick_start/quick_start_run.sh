@@ -17,6 +17,9 @@
 
 task="finalpool/find-alita-paper"
 
+export TOOLATHLON_OPENAI_API_KEY="xxx"
+export TOOLATHLON_OPENAI_BASE_URL="xxx"
+
 #### after you have do the full praparation, you can switch to any task under `tasks/finalpool`, the format be like `finalpool/{taskname}`
 
 # for the model_short_name here we use the claude sonnet 4.5 model ID from OpenRouter
@@ -24,7 +27,7 @@ uv run main.py \
 --eval_config scripts/quick_start/quick_start_eval_config.json \
 --task_dir $task \
 --debug \
---model_short_name anthropic/claude-sonnet-4.5 \
+--model_short_name google/gemini-3-pro-preview \
 --provider unified \
 --max_steps_under_single_turn_mode 200 \
 # --multi_turn_mode \

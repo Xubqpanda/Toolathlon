@@ -24,7 +24,8 @@ WORKERS=${4:-10} # number of workers to use in parallel evaluation
 TIMEOUT="2400" # the timeout for each task execution, including pre-processing, agentloop and post-processing
 
 # model sampling related arguments
-TEMPERATURE="0.6"
+TEMPERATURE="${SELF_TEMPERATURE:-0.6}"
+echo "Using temperature ${TEMPERATURE} for agent model."
 TOP_P="1"
 MAX_TOKENS="8192"
 IMAGE_NAME=${5:-"lockon0927/toolathlon-task-image:1016beta"}  # Docker image to use

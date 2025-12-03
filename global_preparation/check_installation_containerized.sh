@@ -241,7 +241,7 @@ fi
 
 # Test Kind functionality
 echo "Testing Kind connection..."
-if $CONTAINER_RUNTIME exec "$CONTAINER_NAME" $CONTAINER_RUNTIME version >/dev/null 2>&1; then
+if $CONTAINER_RUNTIME exec --env DOCKER_API_VERSION=1.44 "$CONTAINER_NAME" $CONTAINER_RUNTIME version >/dev/null 2>&1; then
     echo "✓ $CONTAINER_RUNTIME API accessible"
 else
     echo "✗ Cannot access $CONTAINER_RUNTIME API"
@@ -261,7 +261,7 @@ echo ""
 
 # Actually run the task inside the container
 echo "Checking installation..."
-$CONTAINER_RUNTIME exec -it "$CONTAINER_NAME" bash -c "$CONTAINER_CMD"
+$CONTAINER_RUNTIME exec --env DOCKER_API_VERSION=1.44 -it "$CONTAINER_NAME" bash -c "$CONTAINER_CMD"
 EXEC_EXIT_CODE=$?
 
 echo ""

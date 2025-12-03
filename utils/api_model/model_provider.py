@@ -25,8 +25,8 @@ from openai._utils import PropertyInfo
 
 
 class ResponseOutputReasoningContent(BaseModel):
-    reasoning_content: str
-    pure_thinking_str: str
+    reasoning_content: str | None
+    pure_thinking_str: str | None
     """The reasoning content from the model."""
     type: Literal["reasoning_content"] = "reasoning_content"
 
@@ -83,11 +83,12 @@ class ConverterWithExplicitReasoningContent(Converter):
 
         if message.tool_calls:
             for tool_call in message.tool_calls:
+                arguments = tool_call.function.arguments if tool_call.function.arguments else "{}"
                 items.append(
                     ResponseFunctionToolCall(
                         id=FAKE_RESPONSES_ID,
                         call_id=tool_call.id,
-                        arguments=tool_call.function.arguments,
+                        arguments=arguments,
                         name=tool_call.function.name,
                         type="function_call",
                     )
@@ -965,6 +966,13 @@ API_MAPPINGS = {
                    "openrouter": "anthropic/claude-opus-4.1",
                    "anthropic": "claude-opus-4-1-20250805"},
         price=[16.5/1000, 82.5/1000],
+        concurrency=32,
+        context_window=200000,
+        openrouter_config={"provider": {"only": ["anthropic"]}}
+    ),
+    'claude-4.5-opus': Dict(
+        api_model={"openrouter": "anthropic/claude-opus-4.5"},
+        price=[5/1000, 25/1000],
         concurrency=32,
         context_window=200000,
         openrouter_config={"provider": {"only": ["anthropic"]}}
