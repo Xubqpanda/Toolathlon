@@ -6,6 +6,10 @@ This server allows remote clients to submit evaluation tasks.
 Only one task can run at a time, with IP rate limiting (3 tasks per 24 hours).
 """
 
+# Version control
+SERVER_VERSION = "1.0"
+SUPPORTED_CLIENT_VERSIONS = ["1.0"]  # List of supported client versions
+
 import asyncio
 import os
 import sys
@@ -46,6 +50,7 @@ transferred_tasks: Dict[str, set] = defaultdict(set)  # job_id -> set of transfe
 TIMEOUT_SECONDS = 240 * 60  # 240 minutes
 MAX_SUBMISSIONS_PER_IP = 3
 RATE_LIMIT_HOURS = 24
+MAX_WORKERS = 10  # Will be updated in main
 DUMPS_DIR = "./dumps_public_service"
 SERVER_PORT = 8080  # Will be updated in main
 WS_PROXY_PORT = 8081  # Will be updated in main
@@ -53,6 +58,7 @@ WS_PROXY_PORT = 8081  # Will be updated in main
 # ===== Request/Response Models =====
 
 class SubmitEvaluationRequest(BaseModel):
+    client_version: Optional[str] = None  # Client version for compatibility check (None means old client without version)
     mode: str  # "public" or "private"
     base_url: str
     api_key: Optional[str] = None
@@ -429,6 +435,41 @@ async def submit_evaluation(request: Request, data: SubmitEvaluationRequest):
     global current_job
 
     client_ip = request.client.host
+
+    # Check if client has version (old clients won't have this field)
+    if data.client_version is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Client version missing",
+                "message": "Your client is too old and does not report a version number.",
+                "server_version": SERVER_VERSION,
+                "action": "Please update your client from https://github.com/hkust-nlp/Toolathlon"
+            }
+        )
+
+    # Check client version compatibility
+    if data.client_version not in SUPPORTED_CLIENT_VERSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Client version not supported",
+                "message": f"Client version '{data.client_version}' is not compatible with server version '{SERVER_VERSION}'.",
+                "supported_versions": SUPPORTED_CLIENT_VERSIONS,
+                "action": "Please update your client from https://github.com/hkust-nlp/Toolathlon"
+            }
+        )
+
+    # Check workers limit
+    if data.workers > MAX_WORKERS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Workers limit exceeded",
+                "message": f"Requested workers ({data.workers}) exceeds server limit ({MAX_WORKERS}).",
+                "max_workers": MAX_WORKERS
+            }
+        )
 
     # Check IP rate limit
     allowed, error_msg = check_ip_rate_limit(client_ip)
@@ -971,11 +1012,13 @@ if __name__ == "__main__":
     server_port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
     ws_proxy_port = int(sys.argv[2]) if len(sys.argv) > 2 else 8081
     max_submissions = int(sys.argv[3]) if len(sys.argv) > 3 else 3
+    max_workers = int(sys.argv[4]) if len(sys.argv) > 4 else 10
 
     # Update global variables
     SERVER_PORT = server_port
     WS_PROXY_PORT = ws_proxy_port
     MAX_SUBMISSIONS_PER_IP = max_submissions
+    MAX_WORKERS = max_workers
 
     # Format rate limit message
     if MAX_SUBMISSIONS_PER_IP == -1:
@@ -987,9 +1030,12 @@ if __name__ == "__main__":
 {'='*60}
 Toolathlon Remote Evaluation Server
 {'='*60}
+Server Version: {SERVER_VERSION}
+Supported Client Versions: {', '.join(SUPPORTED_CLIENT_VERSIONS)}
 Server Port: {server_port}
 WebSocket Proxy Port: {ws_proxy_port} (for private mode)
 Max tasks per IP: {rate_limit_msg}
+Max workers per task: {max_workers}
 Timeout: {TIMEOUT_SECONDS//60} minutes
 Output directory: {DUMPS_DIR}
 {'='*60}

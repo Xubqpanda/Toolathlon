@@ -6,6 +6,9 @@ Submit evaluation tasks to remote Toolathlon server.
 Supports both public API mode and private (local vLLM) mode.
 """
 
+# Version control
+CLIENT_VERSION = "1.0"
+
 import asyncio
 import json
 import os
@@ -958,6 +961,7 @@ def run(
 
         with httpx.Client(timeout=30.0) as client:
             submit_data = {
+                "client_version": CLIENT_VERSION,  # Send client version for compatibility check
                 "mode": mode,
                 "base_url": base_url,
                 "api_key": api_key,
@@ -982,8 +986,43 @@ def run(
 
             if resp.status_code != 200:
                 error_data = resp.json()
-                typer.echo(f"\n❌ Task submission failed:", err=True)
-                typer.echo(f"   {error_data.get('detail', 'Unknown error')}", err=True)
+                detail = error_data.get('detail', 'Unknown error')
+
+                # Handle detailed error responses (dict)
+                if isinstance(detail, dict):
+                    error_type = detail.get('error', 'Error')
+                    message = detail.get('message', 'Unknown error')
+
+                    typer.echo(f"\n❌ {error_type}:", err=True)
+                    typer.echo(f"   {message}", err=True)
+
+                    # Version missing error (old client)
+                    if error_type == "Client version missing":
+                        server_version = detail.get('server_version', 'unknown')
+                        typer.echo(f"\n   Server version: {server_version}", err=True)
+                        typer.echo(f"   (Client version is defined at the top of eval_client.py)", err=True)
+                        typer.echo(f"\n   ⚠️  Please update your client from:", err=True)
+                        typer.echo(f"   https://github.com/hkust-nlp/Toolathlon", err=True)
+
+                    # Version compatibility error
+                    elif error_type == "Client version not supported":
+                        supported = detail.get('supported_versions', [])
+                        typer.echo(f"\n   Your client version: {CLIENT_VERSION}", err=True)
+                        typer.echo(f"   Supported versions: {', '.join(supported)}", err=True)
+                        typer.echo(f"   (Version is defined at the top of eval_client.py)", err=True)
+                        typer.echo(f"\n   ⚠️  Please update your client from:", err=True)
+                        typer.echo(f"   https://github.com/hkust-nlp/Toolathlon", err=True)
+
+                    # Workers limit error
+                    elif error_type == "Workers limit exceeded":
+                        max_workers = detail.get('max_workers', 'unknown')
+                        typer.echo(f"\n   Server allows maximum {max_workers} workers", err=True)
+                        typer.echo(f"   Please reduce --workers to {max_workers} or less", err=True)
+                else:
+                    # Simple string error
+                    typer.echo(f"\n❌ Task submission failed:", err=True)
+                    typer.echo(f"   {detail}", err=True)
+
                 raise typer.Exit(1)
 
             result = resp.json()
