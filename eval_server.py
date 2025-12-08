@@ -41,6 +41,8 @@ app = FastAPI(title="Toolathlon Eval Server")
 
 # ===== Global State =====
 current_job: Optional[Dict[str, Any]] = None
+# New structure: ip -> list of job records
+# Each record: {"job_id": str, "submitted_at": str, "completed_at": str or None, "duration_seconds": int or None}
 ip_submission_history: Dict[str, list] = defaultdict(list)
 ws_proxy_process = None  # Global WebSocket proxy process
 ws_proxy_log_file = None  # Global log file handle
@@ -48,10 +50,12 @@ transferred_tasks: Dict[str, set] = defaultdict(set)  # job_id -> set of transfe
 
 # ===== Configuration =====
 TIMEOUT_SECONDS = 240 * 60  # 240 minutes
-MAX_SUBMISSIONS_PER_IP = 3
-RATE_LIMIT_HOURS = 24
+MAX_SUBMISSIONS_PER_IP = 3  # Max number of requests per IP
+RATE_LIMIT_HOURS = 24  # Time window for request count limit
+MAX_DURATION_MINUTES = 180  # Max cumulative duration in minutes (-1 for unlimited)
 MAX_WORKERS = 10  # Will be updated in main
 DUMPS_DIR = "./dumps_public_service"
+RATE_LIMIT_DATA_FILE = "./dumps_public_service/ip_rate_limit_data.json"
 SERVER_PORT = 8080  # Will be updated in main
 WS_PROXY_PORT = 8081  # Will be updated in main
 
@@ -77,6 +81,46 @@ class SubmitEvaluationResponse(BaseModel):
     warning: Optional[str] = None  # Warning if job_id already exists
 
 # ===== Helper Functions =====
+
+def load_rate_limit_data():
+    """Load IP rate limit data from persistent file"""
+    global ip_submission_history
+
+    if not Path(RATE_LIMIT_DATA_FILE).exists():
+        log(f"No existing rate limit data file found, starting fresh")
+        return
+
+    try:
+        with open(RATE_LIMIT_DATA_FILE, 'r') as f:
+            data = json.load(f)
+
+        # Convert loaded data back to defaultdict
+        ip_submission_history = defaultdict(list, data)
+
+        # Count total records
+        total_records = sum(len(records) for records in ip_submission_history.values())
+        log(f"Loaded rate limit data: {len(ip_submission_history)} IPs, {total_records} total records")
+
+    except Exception as e:
+        log(f"Warning: Failed to load rate limit data: {e}")
+        ip_submission_history = defaultdict(list)
+
+def save_rate_limit_data():
+    """Save IP rate limit data to persistent file"""
+    try:
+        # Ensure directory exists
+        Path(RATE_LIMIT_DATA_FILE).parent.mkdir(parents=True, exist_ok=True)
+
+        # Convert defaultdict to regular dict for JSON serialization
+        data_to_save = dict(ip_submission_history)
+
+        with open(RATE_LIMIT_DATA_FILE, 'w') as f:
+            json.dump(data_to_save, f, indent=2)
+
+        log(f"Saved rate limit data: {len(data_to_save)} IPs")
+
+    except Exception as e:
+        log(f"Error: Failed to save rate limit data: {e}")
 
 def load_sensitive_values() -> Dict[str, str]:
     """Load sensitive values from token_key_session.py"""
@@ -174,6 +218,27 @@ def anonymize_directory(source_dir: Path, temp_dir: Path, sensitive_values: Dict
                 # Binary file - copy as is
                 shutil.copy2(item, dest_item)
 
+def record_job_completion(job_id: str, client_ip: str, start_timestamp: float):
+    """Record job completion time and duration in IP submission history"""
+    try:
+        end_time = datetime.now()
+        duration_seconds = int(time.time() - start_timestamp)
+
+        # Find the job record for this IP and update it
+        for record in ip_submission_history[client_ip]:
+            if record["job_id"] == job_id:
+                record["completed_at"] = end_time.isoformat()
+                record["duration_seconds"] = duration_seconds
+                break
+
+        # Persist the updated data
+        save_rate_limit_data()
+
+        log(f"[Server] Recorded job {job_id} completion: duration = {duration_seconds}s ({duration_seconds/60:.1f} min)")
+
+    except Exception as e:
+        log(f"[Server] Warning: Failed to record job completion: {e}")
+
 def is_task_finished(status: dict) -> bool:
     """
     Check if a task is finished (including success and failure cases).
@@ -205,28 +270,118 @@ def check_job_id_exists(job_id: str) -> bool:
     job_dir = Path(DUMPS_DIR) / job_id
     return job_dir.exists()
 
-def check_ip_rate_limit(ip: str) -> tuple[bool, str]:
-    """Check if IP has exceeded rate limit"""
-    # -1 means unlimited
-    if MAX_SUBMISSIONS_PER_IP == -1:
-        return True, ""
+def check_ip_rate_limit(ip: str) -> tuple[bool, str, dict]:
+    """
+    Check if IP has exceeded rate limit.
 
+    Returns:
+        tuple: (allowed: bool, error_message: str, info: dict)
+        info contains: {
+            "total_duration_seconds": int,
+            "remaining_duration_seconds": int,
+            "request_count": int,
+            "remaining_requests": int,
+            "limit_mode": str  # "both", "duration_only", "count_only", "unlimited"
+        }
+    """
     now = datetime.now()
     cutoff = now - timedelta(hours=RATE_LIMIT_HOURS)
 
-    # Clean old records
+    # Clean old records (older than RATE_LIMIT_HOURS)
     ip_submission_history[ip] = [
-        ts for ts in ip_submission_history[ip]
-        if ts > cutoff
+        record for record in ip_submission_history[ip]
+        if datetime.fromisoformat(record["submitted_at"]) > cutoff
     ]
 
-    count = len(ip_submission_history[ip])
-    if count >= MAX_SUBMISSIONS_PER_IP:
-        oldest = ip_submission_history[ip][0]
-        retry_after = oldest + timedelta(hours=RATE_LIMIT_HOURS)
-        return False, f"Rate limit exceeded: {MAX_SUBMISSIONS_PER_IP} tasks per {RATE_LIMIT_HOURS} hours. Retry after {retry_after.isoformat()}"
+    # Calculate stats
+    completed_jobs = [r for r in ip_submission_history[ip] if r.get("completed_at") is not None]
+    total_duration_seconds = sum(r.get("duration_seconds", 0) for r in completed_jobs)
+    request_count = len(ip_submission_history[ip])
 
-    return True, ""
+    # Determine limit mode
+    has_duration_limit = MAX_DURATION_MINUTES != -1
+    has_count_limit = MAX_SUBMISSIONS_PER_IP != -1
+
+    if not has_duration_limit and not has_count_limit:
+        # Both unlimited
+        return True, "", {
+            "total_duration_seconds": total_duration_seconds,
+            "remaining_duration_seconds": -1,
+            "request_count": request_count,
+            "remaining_requests": -1,
+            "limit_mode": "unlimited"
+        }
+
+    # Calculate remaining quotas
+    max_duration_seconds = MAX_DURATION_MINUTES * 60 if has_duration_limit else -1
+    remaining_duration_seconds = max_duration_seconds - total_duration_seconds if has_duration_limit else -1
+    remaining_requests = MAX_SUBMISSIONS_PER_IP - request_count if has_count_limit else -1
+
+    info = {
+        "total_duration_seconds": total_duration_seconds,
+        "remaining_duration_seconds": remaining_duration_seconds,
+        "request_count": request_count,
+        "remaining_requests": remaining_requests,
+        "limit_mode": "both" if (has_duration_limit and has_count_limit) else
+                     ("duration_only" if has_duration_limit else "count_only")
+    }
+
+    # Apply rate limit logic based on mode
+    if has_duration_limit and has_count_limit:
+        # Both limits active: duration first, then count
+        if total_duration_seconds < max_duration_seconds:
+            # Duration not exceeded - allow
+            return True, "", info
+        else:
+            # Duration exceeded - check count limit
+            if request_count >= MAX_SUBMISSIONS_PER_IP:
+                # Both exceeded
+                oldest = ip_submission_history[ip][0]
+                retry_after = datetime.fromisoformat(oldest["submitted_at"]) + timedelta(hours=RATE_LIMIT_HOURS)
+                error_msg = (
+                    f"Rate limit exceeded:\n"
+                    f"  • Cumulative duration: {total_duration_seconds/60:.1f} / {MAX_DURATION_MINUTES} minutes (EXCEEDED)\n"
+                    f"  • Request count: {request_count} / {MAX_SUBMISSIONS_PER_IP} (EXCEEDED)\n"
+                    f"  • Time window: {RATE_LIMIT_HOURS} hours\n"
+                    f"  • Retry after: {retry_after.isoformat()}"
+                )
+                return False, error_msg, info
+            else:
+                # Duration exceeded but count ok - allow
+                return True, "", info
+
+    elif has_duration_limit:
+        # Duration limit only
+        if total_duration_seconds >= max_duration_seconds:
+            # Find when the oldest completed job will expire
+            oldest_completed = min(
+                (r for r in completed_jobs),
+                key=lambda r: r["completed_at"],
+                default=None
+            )
+            retry_after = datetime.fromisoformat(oldest_completed["completed_at"]) + timedelta(hours=RATE_LIMIT_HOURS) if oldest_completed else now
+            error_msg = (
+                f"Rate limit exceeded:\n"
+                f"  • Cumulative duration: {total_duration_seconds/60:.1f} / {MAX_DURATION_MINUTES} minutes (EXCEEDED)\n"
+                f"  • Time window: {RATE_LIMIT_HOURS} hours\n"
+                f"  • Retry after: {retry_after.isoformat()}"
+            )
+            return False, error_msg, info
+
+    elif has_count_limit:
+        # Count limit only
+        if request_count >= MAX_SUBMISSIONS_PER_IP:
+            oldest = ip_submission_history[ip][0]
+            retry_after = datetime.fromisoformat(oldest["submitted_at"]) + timedelta(hours=RATE_LIMIT_HOURS)
+            error_msg = (
+                f"Rate limit exceeded:\n"
+                f"  • Request count: {request_count} / {MAX_SUBMISSIONS_PER_IP} (EXCEEDED)\n"
+                f"  • Time window: {RATE_LIMIT_HOURS} hours\n"
+                f"  • Retry after: {retry_after.isoformat()}"
+            )
+            return False, error_msg, info
+
+    return True, "", info
 
 async def run_command_async(cmd: list, env: dict, log_file: str):
     """Run command asynchronously and capture output to log file"""
@@ -359,6 +514,10 @@ async def execute_evaluation(job_id: str, mode: str, config: Dict[str, Any]):
                 current_job["status"] = "timeout"
                 current_job["error"] = f"Task exceeded {TIMEOUT_SECONDS//60} minutes"
                 log(f"[Server] Job {job_id} timed out after {elapsed//60:.1f} minutes")
+
+                # Record completion time and duration
+                record_job_completion(job_id, current_job["client_ip"], current_job["start_timestamp"])
+
                 return
 
             await asyncio.sleep(5)
@@ -387,6 +546,9 @@ async def execute_evaluation(job_id: str, mode: str, config: Dict[str, Any]):
         current_job["status"] = "completed"
         log(f"[Server] Job {job_id} completed successfully")
 
+        # Record completion time and duration
+        record_job_completion(job_id, current_job["client_ip"], current_job["start_timestamp"])
+
     except Exception as e:
         error_msg = str(e)
         with open(log_file, 'a') as f:
@@ -395,6 +557,9 @@ async def execute_evaluation(job_id: str, mode: str, config: Dict[str, Any]):
         current_job["status"] = "failed"
         current_job["error"] = error_msg
         log(f"[Server] Job {job_id} failed: {error_msg}")
+
+        # Record completion time and duration
+        record_job_completion(job_id, current_job["client_ip"], current_job["start_timestamp"])
 
     finally:
         # Keep job info for 60 seconds for client to retrieve
@@ -472,7 +637,7 @@ async def submit_evaluation(request: Request, data: SubmitEvaluationRequest):
         )
 
     # Check IP rate limit
-    allowed, error_msg = check_ip_rate_limit(client_ip)
+    allowed, error_msg, limit_info = check_ip_rate_limit(client_ip)
     if not allowed:
         raise HTTPException(status_code=429, detail=error_msg)
 
@@ -504,8 +669,17 @@ async def submit_evaluation(request: Request, data: SubmitEvaluationRequest):
 
     client_id = f"client_{uuid.uuid4().hex[:8]}" if data.mode == "private" else None
 
-    # Record IP submission
-    ip_submission_history[client_ip].append(datetime.now())
+    # Record IP submission with detailed info
+    submission_time = datetime.now()
+    ip_submission_history[client_ip].append({
+        "job_id": job_id,
+        "submitted_at": submission_time.isoformat(),
+        "completed_at": None,
+        "duration_seconds": None
+    })
+
+    # Save after adding new submission
+    save_rate_limit_data()
 
     # Initialize job
     current_job = {
@@ -516,7 +690,8 @@ async def submit_evaluation(request: Request, data: SubmitEvaluationRequest):
         "model_name": data.model_name,
         "workers": data.workers,
         "status": "running",
-        "started_at": datetime.now().isoformat()
+        "started_at": submission_time.isoformat(),
+        "start_timestamp": submission_time.timestamp()  # For duration calculation
     }
 
     # Start background task
@@ -542,11 +717,38 @@ async def submit_evaluation(request: Request, data: SubmitEvaluationRequest):
     if data.skip_container_restart:
         log(f"[Server] WARNING: Container restart will be skipped (debugging/testing mode only)")
 
+    # Prepare rate limit info for response
+    rate_limit_info = {
+        "limit_mode": limit_info["limit_mode"],
+        "usage": {}
+    }
+
+    if limit_info["limit_mode"] in ["both", "duration_only", "unlimited"]:
+        if limit_info["remaining_duration_seconds"] == -1:
+            rate_limit_info["usage"]["duration"] = "unlimited"
+        else:
+            rate_limit_info["usage"]["duration"] = {
+                "used_minutes": round(limit_info["total_duration_seconds"] / 60, 1),
+                "remaining_minutes": round(limit_info["remaining_duration_seconds"] / 60, 1),
+                "limit_minutes": MAX_DURATION_MINUTES
+            }
+
+    if limit_info["limit_mode"] in ["both", "count_only", "unlimited"]:
+        if limit_info["remaining_requests"] == -1:
+            rate_limit_info["usage"]["requests"] = "unlimited"
+        else:
+            rate_limit_info["usage"]["requests"] = {
+                "used": limit_info["request_count"] + 1,  # +1 for current request
+                "remaining": limit_info["remaining_requests"] - 1,  # -1 because we just added one
+                "limit": MAX_SUBMISSIONS_PER_IP
+            }
+
     response = {
         "status": "accepted",
         "job_id": job_id,
         "client_id": client_id,
-        "message": "Task accepted and started"
+        "message": "Task accepted and started",
+        "rate_limit_info": rate_limit_info
     }
 
     if warning_msg:
@@ -925,6 +1127,55 @@ async def get_static_files(job_id: str):
 
     return result
 
+# ===== Background Tasks =====
+
+async def cleanup_old_files_periodically():
+    """
+    Background task that runs every 24 hours to clean up old job directories.
+    Deletes directories in DUMPS_DIR that haven't been modified in 7 days.
+    """
+    while True:
+        try:
+            await asyncio.sleep(24 * 3600)  # Sleep for 24 hours
+
+            log("[Server] Running periodic cleanup of old job directories...")
+
+            dumps_path = Path(DUMPS_DIR)
+            if not dumps_path.exists():
+                continue
+
+            now = time.time()
+            seven_days_ago = now - (7 * 24 * 3600)
+
+            deleted_count = 0
+            for item in dumps_path.iterdir():
+                # Skip the rate limit data file
+                if item.name == "ip_rate_limit_data.json":
+                    continue
+
+                # Only process directories (job folders)
+                if not item.is_dir():
+                    continue
+
+                # Check last modification time
+                try:
+                    mtime = item.stat().st_mtime
+                    if mtime < seven_days_ago:
+                        # Directory older than 7 days, delete it
+                        shutil.rmtree(item)
+                        deleted_count += 1
+                        log(f"[Server] Deleted old job directory: {item.name} (last modified: {datetime.fromtimestamp(mtime).isoformat()})")
+                except Exception as e:
+                    log(f"[Server] Error deleting directory {item.name}: {e}")
+
+            log(f"[Server] Cleanup complete: deleted {deleted_count} old job directories")
+
+        except asyncio.CancelledError:
+            log("[Server] Cleanup task cancelled")
+            break
+        except Exception as e:
+            log(f"[Server] Error in cleanup task: {e}")
+
 # ===== Main =====
 
 def cleanup_on_shutdown():
@@ -1013,18 +1264,41 @@ if __name__ == "__main__":
     ws_proxy_port = int(sys.argv[2]) if len(sys.argv) > 2 else 8081
     max_submissions = int(sys.argv[3]) if len(sys.argv) > 3 else 3
     max_workers = int(sys.argv[4]) if len(sys.argv) > 4 else 10
+    max_duration_minutes = int(sys.argv[5]) if len(sys.argv) > 5 else 180
 
     # Update global variables
     SERVER_PORT = server_port
     WS_PROXY_PORT = ws_proxy_port
     MAX_SUBMISSIONS_PER_IP = max_submissions
     MAX_WORKERS = max_workers
+    MAX_DURATION_MINUTES = max_duration_minutes
 
-    # Format rate limit message
+    # Load persistent rate limit data
+    load_rate_limit_data()
+
+    # Format rate limit messages
     if MAX_SUBMISSIONS_PER_IP == -1:
-        rate_limit_msg = "Unlimited (no rate limiting)"
+        count_limit_msg = "Unlimited"
     else:
-        rate_limit_msg = f"{MAX_SUBMISSIONS_PER_IP} per {RATE_LIMIT_HOURS} hours"
+        count_limit_msg = f"{MAX_SUBMISSIONS_PER_IP} per {RATE_LIMIT_HOURS} hours"
+
+    if MAX_DURATION_MINUTES == -1:
+        duration_limit_msg = "Unlimited"
+    else:
+        duration_limit_msg = f"{MAX_DURATION_MINUTES} minutes per {RATE_LIMIT_HOURS} hours"
+
+    # Determine rate limit mode
+    has_duration_limit = MAX_DURATION_MINUTES != -1
+    has_count_limit = MAX_SUBMISSIONS_PER_IP != -1
+
+    if not has_duration_limit and not has_count_limit:
+        limit_mode = "No rate limiting"
+    elif has_duration_limit and has_count_limit:
+        limit_mode = f"Dual limit (duration: {duration_limit_msg}, count: {count_limit_msg})"
+    elif has_duration_limit:
+        limit_mode = f"Duration limit only: {duration_limit_msg}"
+    else:
+        limit_mode = f"Count limit only: {count_limit_msg}"
 
     print(f"""
 {'='*60}
@@ -1034,7 +1308,7 @@ Server Version: {SERVER_VERSION}
 Supported Client Versions: {', '.join(SUPPORTED_CLIENT_VERSIONS)}
 Server Port: {server_port}
 WebSocket Proxy Port: {ws_proxy_port} (for private mode)
-Max tasks per IP: {rate_limit_msg}
+Rate limiting: {limit_mode}
 Max workers per task: {max_workers}
 Timeout: {TIMEOUT_SECONDS//60} minutes
 Output directory: {DUMPS_DIR}
@@ -1058,6 +1332,12 @@ Output directory: {DUMPS_DIR}
     print(f"✓ WebSocket proxy started (PID: {ws_proxy_process.pid})")
     print(f"  Log: {ws_log_path}")
     print("="*60)
+
+    # Start background cleanup task when FastAPI starts
+    @app.on_event("startup")
+    async def startup_event():
+        asyncio.create_task(cleanup_old_files_periodically())
+        log("[Server] Started background cleanup task (runs every 24 hours)")
 
     try:
         uvicorn.run(app, host="0.0.0.0", port=server_port)
