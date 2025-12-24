@@ -18,6 +18,51 @@ def log(msg):
     utc_time = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
     print(f"[{local_time}][UTC {utc_time}] {msg}", flush=True)
 
+class AdaptiveTimeout:
+    """自适应超时管理器，基于历史平均的动态超时（类似 TCP RTO 算法）"""
+    def __init__(self, initial_timeout=60.0, min_timeout=10.0, max_timeout=300.0):
+        self.timeout = initial_timeout
+        self.min_timeout = min_timeout
+        self.max_timeout = max_timeout
+
+        # 类似 TCP 的 SRTT (Smoothed Round Trip Time)
+        self.smoothed_time = initial_timeout
+        self.deviation = 0.0
+        self.update_count = 0
+
+    def update(self, actual_time: float):
+        """根据实际耗时更新超时"""
+        # 指数加权移动平均 (EWMA)
+        alpha = 0.125  # 平滑因子
+        beta = 0.25    # 偏差因子
+
+        # 更新平滑时间
+        self.smoothed_time = (1 - alpha) * self.smoothed_time + alpha * actual_time
+
+        # 更新偏差
+        self.deviation = (1 - beta) * self.deviation + beta * abs(actual_time - self.smoothed_time)
+
+        # 计算新的超时 = 平均 + 4倍偏差 (类似 TCP RTO 算法)
+        self.timeout = self.smoothed_time + 4 * self.deviation
+
+        # 限制在合理范围内
+        self.timeout = max(self.min_timeout, min(self.timeout, self.max_timeout))
+
+        self.update_count += 1
+
+    def get_timeout(self) -> float:
+        """获取当前超时值"""
+        return self.timeout
+
+    def get_stats(self) -> dict:
+        """获取统计信息（用于调试）"""
+        return {
+            "current_timeout": round(self.timeout, 2),
+            "smoothed_time": round(self.smoothed_time, 2),
+            "deviation": round(self.deviation, 2),
+            "update_count": self.update_count
+        }
+
 app = FastAPI()
 
 # Global variables
@@ -29,6 +74,7 @@ responses: Dict[str, dict] = {}  # request_id -> response_data
 cancelled_requests: set = set()  # Cancelled request ID blacklist
 rejected_connections: Dict[str, int] = {}  # IP -> count of rejections (for statistics)
 last_stats_time: float = 0  # Last time we printed statistics
+push_timeout_manager = AdaptiveTimeout(initial_timeout=60.0, min_timeout=10.0, max_timeout=300.0)  # 推送超时管理器
 
 # ===== WebSocket Management =====
 
@@ -217,11 +263,11 @@ async def handle_client_messages(websocket: WebSocket):
                     log(f"[Server] 📥 RESPONSE received from {connected_client_addr}: {request_id} (job: {connected_client_job_id}, status: {response_data.get('status_code')})")
 
             elif msg_type == "heartbeat":
-                # Heartbeat response, add send timeout protection
+                # Heartbeat response, add send timeout protection (30 seconds to tolerate network congestion)
                 try:
                     await asyncio.wait_for(
                         websocket.send_json({"type": "heartbeat_ack"}),
-                        timeout=5.0
+                        timeout=30.0
                     )
                 except asyncio.TimeoutError:
                     log(f"[Server] Send heartbeat response timeout")
@@ -299,9 +345,13 @@ async def push_requests_to_client(websocket: WebSocket):
                 # Calculate average queue time for this batch
                 avg_queue_time = sum(r.get("_queue_time", 0) for r in requests_to_send) / len(requests_to_send)
 
-                log(f"[Server] 📤 PUSH to client {connected_client_addr}: {len(requests_to_send)} request(s) {batch} (job: {connected_client_job_id}, avg queue time: {avg_queue_time:.3f}s)")
+                # Get current adaptive timeout
+                current_timeout = push_timeout_manager.get_timeout()
+                timeout_stats = push_timeout_manager.get_stats()
 
-                # Add send timeout protection (10 seconds)
+                log(f"[Server] 📤 PUSH to client {connected_client_addr}: {len(requests_to_send)} request(s) {batch} (job: {connected_client_job_id}, avg queue time: {avg_queue_time:.3f}s, timeout: {current_timeout:.1f}s)")
+
+                # Add send timeout protection with adaptive timeout
                 try:
                     send_start = datetime.utcnow()
                     await asyncio.wait_for(
@@ -309,13 +359,30 @@ async def push_requests_to_client(websocket: WebSocket):
                             "type": "new_requests",
                             "requests": requests_to_send
                         }),
-                        timeout=10.0
+                        timeout=current_timeout
                     )
                     send_duration = (datetime.utcnow() - send_start).total_seconds()
-                    if send_duration > 0.1:  # If more than 100ms, record warning
-                        log(f"[Server] ⚠️  Push duration {send_duration:.3f} seconds (可能被 TCP 流控阻塞)")
+
+                    # Update adaptive timeout based on actual duration
+                    push_timeout_manager.update(send_duration)
+
+                    # Log with different levels based on duration
+                    if send_duration > 10.0:  # If more than 10 seconds, record warning
+                        log(f"[Server] ⚠️  SLOW PUSH: {send_duration:.3f}s for {len(requests_to_send)} requests (TCP flow control likely), next timeout: {push_timeout_manager.get_timeout():.1f}s")
+                    elif send_duration > 1.0:  # If more than 1 second
+                        log(f"[Server] Push duration: {send_duration:.3f}s (TCP send buffer), next timeout: {push_timeout_manager.get_timeout():.1f}s")
+                    elif send_duration > 0.1:  # If more than 100ms
+                        log(f"[Server] Push duration: {send_duration:.3f}s, next timeout: {push_timeout_manager.get_timeout():.1f}s")
+
+                    # Periodically log timeout statistics (every 20 successful pushes)
+                    if timeout_stats["update_count"] % 20 == 0 and timeout_stats["update_count"] > 0:
+                        log(f"[Server] 📊 Adaptive timeout stats: {timeout_stats}")
+
                 except asyncio.TimeoutError:
-                    log(f"[Server] Push request timeout, connection may有问题")
+                    log(f"[Server] ❌ Push request TIMEOUT after {current_timeout:.1f}s")
+                    # Update timeout manager with increased tolerance (1.5x current timeout)
+                    push_timeout_manager.update(current_timeout * 1.5)
+                    log(f"[Server] Increased timeout to {push_timeout_manager.get_timeout():.1f}s for next push")
                     raise  # Trigger cleanup
 
             await asyncio.sleep(0.1)  # Check every 100ms
@@ -386,6 +453,22 @@ async def _handle_proxy_request(request: Request, request_data: dict, endpoint: 
                 cancelled_requests.add(request_id)  # Add to cancelled blacklist
                 # Do not return anything, connection is disconnected
                 return
+
+        # Check if client (websocket) is still connected
+        if connected_client is None:
+            log(f"[Server] ❌ Client disconnected, cancel {request_id}")
+            pending_requests.pop(request_id, None)
+            responses.pop(request_id, None)
+            return JSONResponse(
+                content={
+                    "error": {
+                        "message": "Client disconnected while processing request",
+                        "type": "client_disconnected",
+                        "code": "client_disconnect"
+                    }
+                },
+                status_code=503
+            )
 
         # Check if response is received
         if request_id in responses:
